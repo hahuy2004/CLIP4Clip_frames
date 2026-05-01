@@ -541,6 +541,13 @@ def main():
                 # paramenters which < freeze_layer_num will be freezed
                 param.requires_grad = False
 
+    if args.local_rank == 0:
+        all_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info("All parameters: %d", all_params)
+        logger.info("Trainable parameters: %d", trainable_params)
+        logger.info("Percentage of training parameters: %.4f", trainable_params / all_params)
+
     ## ####################################
     # dataloader loading
     ## ####################################
