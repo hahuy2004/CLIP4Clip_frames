@@ -397,6 +397,49 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
 
     model.eval()
     with torch.no_grad():
+        # Measure GFLOPs only for eval mode; keep training-time eval unaffected.
+        if args.do_eval:
+            try:
+                from thop import profile
+                logger.info("--- Calculating GFLOPs (STANDARD EVAL) ---")
+
+                sample_batch = next(iter(test_dataloader))
+                sample_batch = tuple(t.to(device) for t in sample_batch)
+                input_ids_s, input_mask_s, segment_ids_s, video_s, video_mask_s = sample_batch
+
+                input_ids_s = input_ids_s[0:1]
+                input_mask_s = input_mask_s[0:1]
+                segment_ids_s = segment_ids_s[0:1]
+                video_s = video_s[0:1]
+                video_mask_s = video_mask_s[0:1]
+
+                class VisWrap(torch.nn.Module):
+                    def __init__(self, m):
+                        super().__init__()
+                        self.m = m
+
+                    def forward(self, v, vm):
+                        return self.m.get_visual_output(v, vm)
+
+                class TextWrap(torch.nn.Module):
+                    def __init__(self, m):
+                        super().__init__()
+                        self.m = m
+
+                    def forward(self, i, s, m):
+                        return self.m.get_sequence_output(i, s, m)
+
+                flops_v, _ = profile(VisWrap(model), inputs=(video_s, video_mask_s), verbose=False)
+                flops_t, _ = profile(TextWrap(model), inputs=(input_ids_s, segment_ids_s, input_mask_s), verbose=False)
+
+                total_flops = flops_v + flops_t
+                logger.info("Visual FLOPs: %.4f GFLOPs", flops_v / 1e9)
+                logger.info("Text FLOPs: %.4f GFLOPs", flops_t / 1e9)
+                logger.info("Total FLOPs: %.4f GFLOPs / 1 Query", total_flops / 1e9)
+                logger.info("-----------------------------------------------------")
+            except Exception as e:
+                logger.warning("Unable to calculate GFLOPs: %s", e)
+
         batch_list_t = []
         batch_list_v = []
         batch_sequence_output_list, batch_visual_output_list = [], []
