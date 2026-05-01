@@ -7,6 +7,7 @@ import torch
 import numpy as np
 import random
 import os
+import copy
 from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
 import time
 import argparse
@@ -403,15 +404,13 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 from thop import profile
                 logger.info("--- Calculating GFLOPs (STANDARD EVAL) ---")
 
-                sample_batch = next(iter(test_dataloader))
-                sample_batch = tuple(t.to(device) for t in sample_batch)
-                input_ids_s, input_mask_s, segment_ids_s, video_s, video_mask_s = sample_batch
-
-                input_ids_s = input_ids_s[0:1]
-                input_mask_s = input_mask_s[0:1]
-                segment_ids_s = segment_ids_s[0:1]
-                video_s = video_s[0:1]
-                video_mask_s = video_mask_s[0:1]
+                # Use dummy tensors instead of consuming a real batch from dataloader.
+                b_size = 1
+                video_s = torch.randn(b_size, 1, 1, args.max_frames, 3, 224, 224).to(device)
+                video_mask_s = torch.ones(b_size, 1, args.max_frames).to(device)
+                input_ids_s = torch.randint(0, 30000, (b_size, 1, args.max_words)).to(device)
+                input_mask_s = torch.ones(b_size, 1, args.max_words).to(device)
+                segment_ids_s = torch.zeros(b_size, 1, args.max_words, dtype=torch.long).to(device)
 
                 class VisWrap(torch.nn.Module):
                     def __init__(self, m):
@@ -429,8 +428,13 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                     def forward(self, i, s, m):
                         return self.m.get_sequence_output(i, s, m)
 
-                flops_v, _ = profile(VisWrap(model), inputs=(video_s, video_mask_s), verbose=False)
-                flops_t, _ = profile(TextWrap(model), inputs=(input_ids_s, segment_ids_s, input_mask_s), verbose=False)
+                profile_model = copy.deepcopy(model.module if hasattr(model, 'module') else model).to(device)
+                profile_model.eval()
+
+                flops_v, _ = profile(VisWrap(profile_model), inputs=(video_s, video_mask_s), verbose=False)
+                flops_t, _ = profile(TextWrap(profile_model), inputs=(input_ids_s, segment_ids_s, input_mask_s), verbose=False)
+
+                del profile_model
 
                 total_flops = flops_v + flops_t
                 logger.info("Visual FLOPs: %.4f GFLOPs", flops_v / 1e9)
