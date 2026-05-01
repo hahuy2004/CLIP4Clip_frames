@@ -49,6 +49,8 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--hard_negative_rate', type=float, default=0.5, help='rate of intra negative sample')
     parser.add_argument('--negative_weighting', type=int, default=1, help='Weight the loss for intra negative')
     parser.add_argument('--n_pair', type=int, default=1, help='Num of pair to output from data loader')
+    parser.add_argument('--max_steps', type=int, default=-1,
+                        help='Maximum number of steps to run for training/evaluation (-1 means no limit)')
 
     parser.add_argument("--output_dir", default=None, type=str, required=True,
                         help="The output directory where the model predictions and checkpoints will be written.")
@@ -235,6 +237,14 @@ def save_model(epoch, args, model, optimizer, tr_loss, type_name=""):
     logger.info("Optimizer saved to %s", optimizer_state_file)
     return output_model_file
 
+def save_best_model(args, model, type_name="best_result"):
+    # Save only model weights (no optimizer state) to a single overwrite file
+    model_to_save = model.module if hasattr(model, 'module') else model
+    output_model_file = os.path.join(args.output_dir, "{}.bin".format(type_name))
+    torch.save(model_to_save.state_dict(), output_model_file)
+    logger.info("Best model weights saved to %s", output_model_file)
+    return output_model_file
+
 def load_model(epoch, args, n_gpu, device, model_file=None):
     if model_file is None or len(model_file) == 0:
         model_file = os.path.join(args.output_dir, "pytorch_model.bin.{}".format(epoch))
@@ -251,7 +261,12 @@ def load_model(epoch, args, n_gpu, device, model_file=None):
         model = None
     return model
 
-def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0):
+def should_save_best_score(r1, r5, best_r1, best_r5):
+    # Save when R1 improves, or when R1 ties and R5 is not worse.
+    return (r1 > best_r1) or (np.isclose(r1, best_r1) and r5 >= best_r5)
+
+def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, scheduler, global_step, local_rank=0,
+                test_dataloader=None, best_score=0.00001, best_score_r5=0.00001):
     global logger
     torch.cuda.empty_cache()
     model.train()
@@ -300,8 +315,40 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                             (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 start_time = time.time()
 
-    total_loss = total_loss / len(train_dataloader)
-    return total_loss, global_step
+            # Step-based evaluation
+            should_step_eval = False
+            if args.datatype == "msrvtt":
+                should_step_eval = ((global_step % 150 == 0) or global_step == 1)
+            elif args.datatype == "didemo":
+                should_step_eval = ((global_step % 50 == 0) or global_step == 1)
+
+            if should_step_eval and test_dataloader is not None:
+                if n_gpu > 1:
+                    torch.distributed.barrier()
+                if local_rank == 0:
+                    logger.info("[Step Eval][%s] Evaluating at global_step %d...", args.datatype, global_step)
+                    R1, R5 = eval_epoch(args, model, test_dataloader, device, n_gpu)
+                    logger.info("[Step Eval] R1: %.4f, R5: %.4f | Best so far -> R1: %.4f, R5: %.4f",
+                                R1, R5, best_score, best_score_r5)
+                    if should_save_best_score(R1, R5, best_score, best_score_r5):
+                        best_score = R1
+                        best_score_r5 = R5
+                        save_best_model(args, model)
+                        logger.info("[Step Eval] New best! R1: %.4f, R5: %.4f, weights saved to best_result.bin",
+                                    R1, R5)
+                if n_gpu > 1:
+                    torch.distributed.barrier()
+                model.train()
+
+        # Check if max_steps is reached
+        if args.max_steps > 0 and step + 1 >= args.max_steps:
+            if local_rank == 0:
+                logger.info("Reached max_steps (%d), stopping training for this epoch.", args.max_steps)
+            break
+
+    actual_steps = min(step + 1, len(train_dataloader)) if args.max_steps <= 0 else min(step + 1, args.max_steps)
+    total_loss = total_loss / actual_steps
+    return total_loss, global_step, best_score, best_score_r5
 
 def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list):
     sim_matrix = []
@@ -459,7 +506,8 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu):
                 format(vt_metrics['R1'], vt_metrics['R5'], vt_metrics['R10'], vt_metrics['MR'], vt_metrics['MeanR']))
 
     R1 = tv_metrics['R1']
-    return R1
+    R5 = tv_metrics['R5']
+    return R1, R5
 
 def main():
     global logger
@@ -540,6 +588,7 @@ def main():
             logger.info("  Num steps = %d", num_train_optimization_steps * args.gradient_accumulation_steps)
 
         best_score = 0.00001
+        best_score_r5 = 0.00001
         best_output_model_file = "None"
         ## ##############################################################
         # resume optimizer state besides loss to continue train
@@ -554,8 +603,10 @@ def main():
         global_step = 0
         for epoch in range(resumed_epoch, args.epochs):
             train_sampler.set_epoch(epoch)
-            tr_loss, global_step = train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer,
-                                               scheduler, global_step, local_rank=args.local_rank)
+            tr_loss, global_step, best_score, best_score_r5 = train_epoch(
+                epoch, args, model, train_dataloader, device, n_gpu, optimizer,
+                scheduler, global_step, local_rank=args.local_rank,
+                test_dataloader=test_dataloader, best_score=best_score, best_score_r5=best_score_r5)
             if args.local_rank == 0:
                 logger.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
 
@@ -565,11 +616,16 @@ def main():
                 # logger.info("Eval on val dataset")
                 # R1 = eval_epoch(args, model, val_dataloader, device, n_gpu)
 
-                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu)
-                if best_score <= R1:
+                R1, R5 = eval_epoch(args, model, test_dataloader, device, n_gpu)
+                if should_save_best_score(R1, R5, best_score, best_score_r5):
                     best_score = R1
+                    best_score_r5 = R5
                     best_output_model_file = output_model_file
-                logger.info("The best model is: {}, the R1 is: {:.4f}".format(best_output_model_file, best_score))
+                    save_best_model(args, model)
+                    logger.info("New best score at end of epoch: R1=%.4f, R5=%.4f, weights saved to best_result.bin",
+                                best_score, best_score_r5)
+                logger.info("The best model is: {}, best R1: {:.4f}, best R5: {:.4f}".format(
+                    best_output_model_file, best_score, best_score_r5))
 
         ## Uncomment if want to test on the best checkpoint
         # if args.local_rank == 0:
