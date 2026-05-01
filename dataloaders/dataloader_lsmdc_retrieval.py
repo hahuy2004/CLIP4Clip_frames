@@ -9,6 +9,7 @@ import numpy as np
 import json
 import math
 from dataloaders.rawvideo_util import RawVideoExtractor
+from dataloaders.rawframes_util import RawFrameExtractor
 
 class LSMDC_DataLoader(Dataset):
     """LSMDC dataset loader."""
@@ -24,6 +25,7 @@ class LSMDC_DataLoader(Dataset):
             image_resolution=224,
             frame_order=0,
             slice_framepos=0,
+            video_data_type='video',
     ):
         self.data_path = data_path
         self.features_path = features_path
@@ -78,7 +80,10 @@ class LSMDC_DataLoader(Dataset):
                 continue
             self.iter2video_pairs_dict[len(self.iter2video_pairs_dict)] = (clip_id, sentence)
 
+        self.video_data_type = video_data_type
+        assert self.video_data_type in ['video', 'frames']
         self.rawVideoExtractor = RawVideoExtractor(framerate=feature_framerate, size=image_resolution)
+        self.rawFrameExtractor = RawFrameExtractor(size=image_resolution)
         self.SPECIAL_TOKEN = {"CLS_TOKEN": "<|startoftext|>", "SEP_TOKEN": "<|endoftext|>",
                               "MASK_TOKEN": "[MASK]", "UNK_TOKEN": "[UNK]", "PAD_TOKEN": "[PAD]"}
 
@@ -159,7 +164,7 @@ class LSMDC_DataLoader(Dataset):
 
         # Pair x L x T x 3 x H x W
         video = np.zeros((len(choice_video_ids), self.max_frames, 1, 3,
-                          self.rawVideoExtractor.size, self.rawVideoExtractor.size), dtype=np.float)
+                          self.rawVideoExtractor.size, self.rawVideoExtractor.size), dtype=float)
 
         try:
             for i, video_id in enumerate(choice_video_ids):
@@ -201,8 +206,69 @@ class LSMDC_DataLoader(Dataset):
             video_mask[i][:v_length] = [1] * v_length
         return video, video_mask
 
+    def _get_rawframes(self, choice_video_ids):
+        video_mask = np.zeros((len(choice_video_ids), self.max_frames), dtype=np.long)
+        max_video_length = [0] * len(choice_video_ids)
+
+        # Pair x L x T x 3 x H x W
+        video = np.zeros((len(choice_video_ids), self.max_frames, 1, 3,
+                          self.rawFrameExtractor.size, self.rawFrameExtractor.size), dtype=float)
+
+        try:
+            for i, video_id in enumerate(choice_video_ids):
+                video_id_str = str(video_id).strip()
+                frames_dir = os.path.join(self.features_path, video_id_str)
+
+                if not os.path.exists(frames_dir):
+                    print(f"Frames directory not found: {frames_dir}")
+                    continue
+
+                frames_data = self.rawFrameExtractor.get_frames_data(frames_dir)
+                if frames_data is None:
+                    continue
+
+                raw_video_data = frames_data['frames']  # L x 3 x H x W
+
+                if len(raw_video_data.shape) > 3:
+                    # L x 3 x H x W -> L x 1 x 3 x H x W (add temporal dimension)
+                    raw_video_slice = raw_video_data.unsqueeze(1)
+                    raw_video_slice = raw_video_slice.numpy()  # Convert to numpy for slicing
+
+                    if self.max_frames < raw_video_slice.shape[0]:
+                        if self.slice_framepos == 0:
+                            video_slice = raw_video_slice[:self.max_frames, ...]
+                        elif self.slice_framepos == 1:
+                            video_slice = raw_video_slice[-self.max_frames:, ...]
+                        else:
+                            sample_indx = np.linspace(0, raw_video_slice.shape[0] - 1, num=self.max_frames, dtype=int)
+                            video_slice = raw_video_slice[sample_indx, ...]
+                    else:
+                        video_slice = raw_video_slice
+
+                    if self.frame_order == 1:
+                        video_slice = video_slice[::-1, ...]
+                    elif self.frame_order == 2:
+                        np.random.shuffle(video_slice)
+
+                    slice_len = video_slice.shape[0]
+                    max_video_length[i] = max_video_length[i] if max_video_length[i] > slice_len else slice_len
+                    if slice_len < 1:
+                        pass
+                    else:
+                        video[i][:slice_len, ...] = video_slice
+        except Exception as excep:
+            print("Video ids: {}".format(choice_video_ids))
+            raise excep
+
+        for i, v_length in enumerate(max_video_length):
+            video_mask[i][:v_length] = [1] * v_length
+        return video, video_mask
+
     def __getitem__(self, feature_idx):
         clip_id, sentence = self.iter2video_pairs_dict[feature_idx]
         pairs_text, pairs_mask, pairs_segment, choice_video_ids = self._get_text(clip_id, sentence)
-        video, video_mask = self._get_rawvideo(choice_video_ids)
+        if self.video_data_type == 'video':
+            video, video_mask = self._get_rawvideo(choice_video_ids)
+        else:  # 'frames'
+            video, video_mask = self._get_rawframes(choice_video_ids)
         return pairs_text, pairs_mask, pairs_segment, video, video_mask

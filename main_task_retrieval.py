@@ -96,6 +96,8 @@ def get_args(description='CLIP4Clip on Retrieval Task'):
     parser.add_argument('--freeze_layer_num', type=int, default=0, help="Layer NO. of CLIP need to freeze.")
     parser.add_argument('--slice_framepos', type=int, default=0, choices=[0, 1, 2],
                         help="0: cut from head frames; 1: cut from tail frames; 2: extract frames uniformly.")
+    parser.add_argument('--video_data_type', type=str, default='frames', choices=['video', 'frames'],
+                        help="Type of video data: 'video' for raw files (slow), 'frames' for pre-extracted frames (fast).")
     parser.add_argument('--linear_patch', type=str, default="2d", choices=["2d", "3d"],
                         help="linear projection of flattened patches.")
     parser.add_argument('--sim_header', type=str, default="meanP",
