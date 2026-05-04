@@ -38,6 +38,9 @@ class DiDeMo_DataLoader(Dataset):
         self.slice_framepos = slice_framepos
         assert self.slice_framepos in [0, 1, 2]
 
+        self.video_data_type = video_data_type
+        assert self.video_data_type in ['video', 'frames']
+
         self.subset = subset
         assert self.subset in ["train", "val", "test"]
 
@@ -87,13 +90,24 @@ class DiDeMo_DataLoader(Dataset):
             caption_dict[k_]["text"] = [" ".join(caption_dict[k_]["text"])]
 
         video_dict = {}
-        for root, dub_dir, video_files in os.walk(self.features_path):
-            for video_file in video_files:
-                video_id_ = video_file
-                if video_id_ not in video_ids:
+        if self.video_data_type == 'frames':
+            # For frames: expect directories containing frame images
+            for item_name in os.listdir(self.features_path):
+                item_path = os.path.join(self.features_path, item_name)
+                if not os.path.isdir(item_path):
                     continue
-                file_path_ = os.path.join(root, video_file)
-                video_dict[video_id_] = file_path_
+                if item_name not in video_ids:
+                    continue
+                video_dict[item_name] = item_path
+        else:
+            # For videos: expect video files
+            for root, dub_dir, video_files in os.walk(self.features_path):
+                for video_file in video_files:
+                    video_id_ = video_file
+                    if video_id_ not in video_ids:
+                        continue
+                    file_path_ = os.path.join(root, video_file)
+                    video_dict[video_id_] = file_path_
 
         self.caption_dict = caption_dict
         self.video_dict = video_dict
@@ -109,8 +123,6 @@ class DiDeMo_DataLoader(Dataset):
             for sub_id in range(n_caption):
                 self.iter2video_pairs_dict[len(self.iter2video_pairs_dict)] = (video_id, sub_id)
 
-        self.video_data_type = video_data_type
-        assert self.video_data_type in ['video', 'frames']
         self.rawVideoExtractor = RawVideoExtractor(framerate=feature_framerate, size=image_resolution)
         self.rawFrameExtractor = RawFrameExtractor(size=image_resolution)
         self.SPECIAL_TOKEN = {"CLS_TOKEN": "<|startoftext|>", "SEP_TOKEN": "<|endoftext|>",
@@ -219,58 +231,58 @@ class DiDeMo_DataLoader(Dataset):
 
         return video, video_mask
 
-    def _get_rawframes(self, idx, s, e):
-        video_mask = np.zeros((len(s), self.max_frames), dtype=np.long)
-        max_video_length = [0] * len(s)
+    def _get_rawframes(self, idx):
+        """Get frames from directory (frames mode). idx is video_id."""
+        video_mask = np.zeros((1, self.max_frames), dtype=np.long)
+        max_video_length = [0]
 
         # Pair x L x T x 3 x H x W
-        video = np.zeros((len(s), self.max_frames, 1, 3,
+        video = np.zeros((1, self.max_frames, 1, 3,
                           self.rawFrameExtractor.size, self.rawFrameExtractor.size), dtype=float)
-        video_id_str = str(idx).strip()
 
         try:
-            for i in range(len(s)):
-                frames_dir = os.path.join(self.features_path, video_id_str)
+            frames_path = self.video_dict[idx]
+            
+            if not os.path.isdir(frames_path):
+                print(f"Frames directory not found: {frames_path}")
+                return video, video_mask
 
-                if not os.path.exists(frames_dir):
-                    print(f"Frames directory not found: {frames_dir}")
-                    continue
+            frames_data = self.rawFrameExtractor.get_frames_data(frames_path)
+            if frames_data is None:
+                print(f"Failed to get frames from: {frames_path}")
+                return video, video_mask
 
-                frames_data = self.rawFrameExtractor.get_frames_data(frames_dir)
-                if frames_data is None:
-                    continue
+            raw_frames_data = frames_data['frames']  # L x 3 x H x W (torch tensor)
 
-                raw_video_data = frames_data['frames']  # L x 3 x H x W
+            if len(raw_frames_data.shape) > 3:
+                # L x 3 x H x W -> L x 1 x 3 x H x W (add temporal dimension)
+                raw_frames_data_clip = raw_frames_data.unsqueeze(1)  # L x 1 x 3 x H x W
+                raw_frames_data_clip = raw_frames_data_clip.numpy()  # Convert to numpy
 
-                if len(raw_video_data.shape) > 3:
-                    # L x 3 x H x W -> L x 1 x 3 x H x W (add temporal dimension)
-                    raw_video_slice = raw_video_data.unsqueeze(1)
-                    raw_video_slice = raw_video_slice.numpy()  # Convert to numpy for slicing
-
-                    if self.max_frames < raw_video_slice.shape[0]:
-                        if self.slice_framepos == 0:
-                            video_slice = raw_video_slice[:self.max_frames, ...]
-                        elif self.slice_framepos == 1:
-                            video_slice = raw_video_slice[-self.max_frames:, ...]
-                        else:
-                            sample_indx = np.linspace(0, raw_video_slice.shape[0] - 1, num=self.max_frames, dtype=int)
-                            video_slice = raw_video_slice[sample_indx, ...]
+                # Apply frame sampling based on max_frames
+                if self.max_frames < raw_frames_data_clip.shape[0]:
+                    if self.slice_framepos == 0:
+                        frame_slice = raw_frames_data_clip[:self.max_frames, ...]
+                    elif self.slice_framepos == 1:
+                        frame_slice = raw_frames_data_clip[-self.max_frames:, ...]
                     else:
-                        video_slice = raw_video_slice
+                        sample_indx = np.linspace(0, raw_frames_data_clip.shape[0] - 1, num=self.max_frames, dtype=int)
+                        frame_slice = raw_frames_data_clip[sample_indx, ...]
+                else:
+                    frame_slice = raw_frames_data_clip
 
-                    if self.frame_order == 1:
-                        video_slice = video_slice[::-1, ...]
-                    elif self.frame_order == 2:
-                        np.random.shuffle(video_slice)
+                # Apply frame order
+                if self.frame_order == 1:
+                    frame_slice = frame_slice[::-1, ...]
+                elif self.frame_order == 2:
+                    np.random.shuffle(frame_slice)
 
-                    slice_len = video_slice.shape[0]
-                    max_video_length[i] = max_video_length[i] if max_video_length[i] > slice_len else slice_len
-                    if slice_len < 1:
-                        pass
-                    else:
-                        video[i][:slice_len, ...] = video_slice
+                slice_len = frame_slice.shape[0]
+                max_video_length[0] = slice_len
+                if slice_len > 0:
+                    video[0][:slice_len, ...] = frame_slice
         except Exception as excep:
-            print("video id: {}, start: {}, end: {}, Error: {}".format(idx, s, e, excep))
+            print(f"Error loading frames for video id: {idx}, Error: {excep}")
             pass
 
         for i, v_length in enumerate(max_video_length):
@@ -283,7 +295,9 @@ class DiDeMo_DataLoader(Dataset):
 
         pairs_text, pairs_mask, pairs_segment, starts, ends = self._get_text(video_id, sub_id)
         if self.video_data_type == 'video':
+            # Video mode: use temporal slicing based on start/end times
             video, video_mask = self._get_rawvideo(video_id, starts, ends)
         else:  # 'frames'
-            video, video_mask = self._get_rawframes(video_id, starts, ends)
+            # Frames mode: load all frames from directory, ignore start/end times
+            video, video_mask = self._get_rawframes(video_id)
         return pairs_text, pairs_mask, pairs_segment, video, video_mask
